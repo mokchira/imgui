@@ -21,9 +21,12 @@
 // CHANGELOG
 // (minor and older changes stripped away, please see git history for details)
 //  2022-XX-XX: Platform: Added support for multiple windows via the ImGuiPlatformIO interface.
+//  2022-03-23: Inputs: Fixed a regression in 1.87 which resulted in keyboard modifiers events being reported incorrectly on Linux/X11.
+//  2022-02-07: Added ImGui_ImplGlfw_InstallCallbacks()/ImGui_ImplGlfw_RestoreCallbacks() helpers to facilitate user installing callbacks after initializing backend.
+//  2022-01-26: Inputs: replaced short-lived io.AddKeyModsEvent() (added two weeks ago)with io.AddKeyEvent() using ImGuiKey_ModXXX flags. Sorry for the confusion.
 //  2021-01-20: Inputs: calling new io.AddKeyAnalogEvent() for gamepad support, instead of writing directly to io.NavInputs[].
 //  2022-01-17: Inputs: calling new io.AddMousePosEvent(), io.AddMouseButtonEvent(), io.AddMouseWheelEvent() API (1.87+).
-//  2022-01-17: Inputs: always calling io.AddKeyModsEvent() next and before key event (not in NewFrame) to fix input queue with very low framerates.
+//  2022-01-17: Inputs: always update key mods next and before key event (not in NewFrame) to fix input queue with very low framerates.
 //  2022-01-12: *BREAKING CHANGE*: Now using glfwSetCursorPosCallback(). If you called ImGui_ImplGlfw_InitXXX() with install_callbacks = false, you MUST install glfwSetCursorPosCallback() and forward it to the backend via ImGui_ImplGlfw_CursorPosCallback().
 //  2022-01-10: Inputs: calling new io.AddKeyEvent(), io.AddKeyModsEvent() + io.SetKeyEventNativeData() API (1.87+). Support for full ImGuiKey range.
 //  2022-01-05: Inputs: Converting GLFW untranslated keycodes back to translated keycodes (in the ImGui_ImplGlfw_KeyCallback() function) in order to match the behavior of every other backend, and facilitate the use of GLFW with lettered-shortcuts API.
@@ -109,6 +112,7 @@ struct ImGui_ImplGlfw_Data
     double                  Time;
     GLFWwindow*             MouseWindow;
     GLFWcursor*             MouseCursors[ImGuiMouseCursor_COUNT];
+    ImVec2                  LastValidMousePos;
     GLFWwindow*             KeyOwnerWindows[GLFW_KEY_LAST];
     bool                    InstalledCallbacks;
     bool                    WantUpdateMonitors;
@@ -123,7 +127,7 @@ struct ImGui_ImplGlfw_Data
     GLFWcharfun             PrevUserCallbackChar;
     GLFWmonitorfun          PrevUserCallbackMonitor;
 
-    ImGui_ImplGlfw_Data()   { memset(this, 0, sizeof(*this)); }
+    ImGui_ImplGlfw_Data()   { memset((void*)this, 0, sizeof(*this)); }
 };
 
 // Backend data stored in io.BackendPlatformUserData to allow support for multiple Dear ImGui contexts
@@ -267,15 +271,26 @@ static ImGuiKey ImGui_ImplGlfw_KeyToImGuiKey(int key)
     }
 }
 
+static int ImGui_ImplGlfw_KeyToModifier(int key)
+{
+    if (key == GLFW_KEY_LEFT_CONTROL || key == GLFW_KEY_RIGHT_CONTROL)
+        return GLFW_MOD_CONTROL;
+    if (key == GLFW_KEY_LEFT_SHIFT || key == GLFW_KEY_RIGHT_SHIFT)
+        return GLFW_MOD_SHIFT;
+    if (key == GLFW_KEY_LEFT_ALT || key == GLFW_KEY_RIGHT_ALT)
+        return GLFW_MOD_ALT;
+    if (key == GLFW_KEY_LEFT_SUPER || key == GLFW_KEY_RIGHT_SUPER)
+        return GLFW_MOD_SUPER;
+    return 0;
+}
+
 static void ImGui_ImplGlfw_UpdateKeyModifiers(int mods)
 {
     ImGuiIO& io = ImGui::GetIO();
-    ImGuiKeyModFlags key_mods =
-        ((mods & GLFW_MOD_CONTROL) ? ImGuiKeyModFlags_Ctrl : 0) |
-        ((mods & GLFW_MOD_SHIFT) ? ImGuiKeyModFlags_Shift : 0) |
-        ((mods & GLFW_MOD_ALT) ? ImGuiKeyModFlags_Alt : 0) |
-        ((mods & GLFW_MOD_SUPER) ? ImGuiKeyModFlags_Super : 0);
-    io.AddKeyModsEvent(key_mods);
+    io.AddKeyEvent(ImGuiKey_ModCtrl, (mods & GLFW_MOD_CONTROL) != 0);
+    io.AddKeyEvent(ImGuiKey_ModShift, (mods & GLFW_MOD_SHIFT) != 0);
+    io.AddKeyEvent(ImGuiKey_ModAlt, (mods & GLFW_MOD_ALT) != 0);
+    io.AddKeyEvent(ImGuiKey_ModSuper, (mods & GLFW_MOD_SUPER) != 0);
 }
 
 void ImGui_ImplGlfw_MouseButtonCallback(GLFWwindow* window, int button, int action, int mods)
@@ -309,10 +324,12 @@ static int ImGui_ImplGlfw_TranslateUntranslatedKey(int key, int scancode)
     // See https://github.com/glfw/glfw/issues/1502 for details.
     // Adding a workaround to undo this (so our keys are translated->untranslated->translated, likely a lossy process).
     // This won't cover edge cases but this is at least going to cover common cases.
+    if (key >= GLFW_KEY_KP_0 && key <= GLFW_KEY_KP_EQUAL)
+        return key;
     const char* key_name = glfwGetKeyName(key, scancode);
     if (key_name && key_name[0] != 0 && key_name[1] == 0)
     {
-        const char char_names[] = "'-=[]\\,;\'./";
+        const char char_names[] = "`-=[]\\,;\'./";
         const int char_keys[] = { GLFW_KEY_GRAVE_ACCENT, GLFW_KEY_MINUS, GLFW_KEY_EQUAL, GLFW_KEY_LEFT_BRACKET, GLFW_KEY_RIGHT_BRACKET, GLFW_KEY_BACKSLASH, GLFW_KEY_COMMA, GLFW_KEY_SEMICOLON, GLFW_KEY_APOSTROPHE, GLFW_KEY_PERIOD, GLFW_KEY_SLASH, 0 };
         IM_ASSERT(IM_ARRAYSIZE(char_names) == IM_ARRAYSIZE(char_keys));
         if (key_name[0] >= '0' && key_name[0] <= '9')               { key = GLFW_KEY_0 + (key_name[0] - '0'); }
@@ -335,6 +352,9 @@ void ImGui_ImplGlfw_KeyCallback(GLFWwindow* window, int keycode, int scancode, i
     if (action != GLFW_PRESS && action != GLFW_RELEASE)
         return;
 
+    // Workaround: X11 does not include current pressed/released modifier key in 'mods' flags. https://github.com/glfw/glfw/issues/1630
+    if (int keycode_to_mod = ImGui_ImplGlfw_KeyToModifier(keycode))
+        mods = (action == GLFW_PRESS) ? (mods | keycode_to_mod) : (mods & ~keycode_to_mod);
     ImGui_ImplGlfw_UpdateKeyModifiers(mods);
 
     if (keycode >= 0 && keycode < IM_ARRAYSIZE(bd->KeyOwnerWindows))
@@ -373,8 +393,11 @@ void ImGui_ImplGlfw_CursorPosCallback(GLFWwindow* window, double x, double y)
         y += window_y;
     }
     io.AddMousePosEvent((float)x, (float)y);
+    bd->LastValidMousePos = ImVec2((float)x, (float)y);
 }
 
+// Workaround: X11 seems to send spurious Leave/Enter events which would make us lose our position,
+// so we back it up and restore on Leave/Enter (see https://github.com/ocornut/imgui/issues/4984)
 void ImGui_ImplGlfw_CursorEnterCallback(GLFWwindow* window, int entered)
 {
     ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
@@ -383,9 +406,13 @@ void ImGui_ImplGlfw_CursorEnterCallback(GLFWwindow* window, int entered)
 
     ImGuiIO& io = ImGui::GetIO();
     if (entered)
-        bd->MouseWindow = window;
-    if (!entered && bd->MouseWindow == window)
     {
+        bd->MouseWindow = window;
+        io.AddMousePosEvent(bd->LastValidMousePos.x, bd->LastValidMousePos.y);
+    }
+    else if (!entered && bd->MouseWindow == window)
+    {
+        bd->LastValidMousePos = io.MousePos;
         bd->MouseWindow = NULL;
         io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
     }
@@ -405,6 +432,48 @@ void ImGui_ImplGlfw_MonitorCallback(GLFWmonitor*, int)
 {
     ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
     bd->WantUpdateMonitors = true;
+}
+
+void ImGui_ImplGlfw_InstallCallbacks(GLFWwindow* window)
+{
+    ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
+    IM_ASSERT(bd->InstalledCallbacks == false && "Callbacks already installed!");
+    IM_ASSERT(bd->Window == window);
+
+    bd->PrevUserCallbackWindowFocus = glfwSetWindowFocusCallback(window, ImGui_ImplGlfw_WindowFocusCallback);
+    bd->PrevUserCallbackCursorEnter = glfwSetCursorEnterCallback(window, ImGui_ImplGlfw_CursorEnterCallback);
+    bd->PrevUserCallbackCursorPos = glfwSetCursorPosCallback(window, ImGui_ImplGlfw_CursorPosCallback);
+    bd->PrevUserCallbackMousebutton = glfwSetMouseButtonCallback(window, ImGui_ImplGlfw_MouseButtonCallback);
+    bd->PrevUserCallbackScroll = glfwSetScrollCallback(window, ImGui_ImplGlfw_ScrollCallback);
+    bd->PrevUserCallbackKey = glfwSetKeyCallback(window, ImGui_ImplGlfw_KeyCallback);
+    bd->PrevUserCallbackChar = glfwSetCharCallback(window, ImGui_ImplGlfw_CharCallback);
+    bd->PrevUserCallbackMonitor = glfwSetMonitorCallback(ImGui_ImplGlfw_MonitorCallback);
+    bd->InstalledCallbacks = true;
+}
+
+void ImGui_ImplGlfw_RestoreCallbacks(GLFWwindow* window)
+{
+    ImGui_ImplGlfw_Data* bd = ImGui_ImplGlfw_GetBackendData();
+    IM_ASSERT(bd->InstalledCallbacks == true && "Callbacks not installed!");
+    IM_ASSERT(bd->Window == window);
+
+    glfwSetWindowFocusCallback(window, bd->PrevUserCallbackWindowFocus);
+    glfwSetCursorEnterCallback(window, bd->PrevUserCallbackCursorEnter);
+    glfwSetCursorPosCallback(window, bd->PrevUserCallbackCursorPos);
+    glfwSetMouseButtonCallback(window, bd->PrevUserCallbackMousebutton);
+    glfwSetScrollCallback(window, bd->PrevUserCallbackScroll);
+    glfwSetKeyCallback(window, bd->PrevUserCallbackKey);
+    glfwSetCharCallback(window, bd->PrevUserCallbackChar);
+    glfwSetMonitorCallback(bd->PrevUserCallbackMonitor);
+    bd->InstalledCallbacks = false;
+    bd->PrevUserCallbackWindowFocus = NULL;
+    bd->PrevUserCallbackCursorEnter = NULL;
+    bd->PrevUserCallbackCursorPos = NULL;
+    bd->PrevUserCallbackMousebutton = NULL;
+    bd->PrevUserCallbackScroll = NULL;
+    bd->PrevUserCallbackKey = NULL;
+    bd->PrevUserCallbackChar = NULL;
+    bd->PrevUserCallbackMonitor = NULL;
 }
 
 static bool ImGui_ImplGlfw_Init(GLFWwindow* window, bool install_callbacks, GlfwClientApi client_api)
@@ -455,25 +524,8 @@ static bool ImGui_ImplGlfw_Init(GLFWwindow* window, bool install_callbacks, Glfw
     glfwSetErrorCallback(prev_error_callback);
 
     // Chain GLFW callbacks: our callbacks will call the user's previously installed callbacks, if any.
-    bd->PrevUserCallbackWindowFocus = NULL;
-    bd->PrevUserCallbackCursorEnter = NULL;
-    bd->PrevUserCallbackMousebutton = NULL;
-    bd->PrevUserCallbackScroll = NULL;
-    bd->PrevUserCallbackKey = NULL;
-    bd->PrevUserCallbackChar = NULL;
-    bd->PrevUserCallbackMonitor = NULL;
     if (install_callbacks)
-    {
-        bd->InstalledCallbacks = true;
-        bd->PrevUserCallbackWindowFocus = glfwSetWindowFocusCallback(window, ImGui_ImplGlfw_WindowFocusCallback);
-        bd->PrevUserCallbackCursorEnter = glfwSetCursorEnterCallback(window, ImGui_ImplGlfw_CursorEnterCallback);
-        bd->PrevUserCallbackCursorPos = glfwSetCursorPosCallback(window, ImGui_ImplGlfw_CursorPosCallback);
-        bd->PrevUserCallbackMousebutton = glfwSetMouseButtonCallback(window, ImGui_ImplGlfw_MouseButtonCallback);
-        bd->PrevUserCallbackScroll = glfwSetScrollCallback(window, ImGui_ImplGlfw_ScrollCallback);
-        bd->PrevUserCallbackKey = glfwSetKeyCallback(window, ImGui_ImplGlfw_KeyCallback);
-        bd->PrevUserCallbackChar = glfwSetCharCallback(window, ImGui_ImplGlfw_CharCallback);
-        bd->PrevUserCallbackMonitor = glfwSetMonitorCallback(ImGui_ImplGlfw_MonitorCallback);
-    }
+        ImGui_ImplGlfw_InstallCallbacks(window);
 
     // Update monitors the first time (note: monitor callback are broken in GLFW 3.2 and earlier, see github.com/glfw/glfw/issues/784)
     ImGui_ImplGlfw_UpdateMonitors();
@@ -516,16 +568,7 @@ void ImGui_ImplGlfw_Shutdown()
     ImGui_ImplGlfw_ShutdownPlatformInterface();
 
     if (bd->InstalledCallbacks)
-    {
-        glfwSetWindowFocusCallback(bd->Window, bd->PrevUserCallbackWindowFocus);
-        glfwSetCursorEnterCallback(bd->Window, bd->PrevUserCallbackCursorEnter);
-        glfwSetCursorPosCallback(bd->Window, bd->PrevUserCallbackCursorPos);
-        glfwSetMouseButtonCallback(bd->Window, bd->PrevUserCallbackMousebutton);
-        glfwSetScrollCallback(bd->Window, bd->PrevUserCallbackScroll);
-        glfwSetKeyCallback(bd->Window, bd->PrevUserCallbackKey);
-        glfwSetCharCallback(bd->Window, bd->PrevUserCallbackChar);
-        glfwSetMonitorCallback(bd->PrevUserCallbackMonitor);
-    }
+        ImGui_ImplGlfw_RestoreCallbacks(bd->Window);
 
     for (ImGuiMouseCursor cursor_n = 0; cursor_n < ImGuiMouseCursor_COUNT; cursor_n++)
         glfwDestroyCursor(bd->MouseCursors[cursor_n]);
@@ -574,6 +617,7 @@ static void ImGui_ImplGlfw_UpdateMouseData()
                     mouse_x += window_x;
                     mouse_y += window_y;
                 }
+                bd->LastValidMousePos = ImVec2((float)mouse_x, (float)mouse_y);
                 io.AddMousePosEvent((float)mouse_x, (float)mouse_y);
             }
         }
